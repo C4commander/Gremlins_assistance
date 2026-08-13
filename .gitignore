@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+outputs/
+.watch-build-state
+
+config.json
+*.log
+
+card_images_full/
+gremlinopedia_images/
+
