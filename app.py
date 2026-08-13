@@ -105,6 +105,15 @@ class CaptureRecord:
     items_counted: dict[str, int]
 
 
+@dataclass(slots=True)
+class CardInfo:
+    name: str
+    image_path: Path | None
+    description: str = ""
+    flavor: str = ""
+    card_type: str = ""
+
+
 def load_config() -> AppConfig:
     if not CONFIG_PATH.exists():
         return AppConfig()
@@ -371,26 +380,51 @@ def iter_card_map_paths() -> list[Path]:
     return paths
 
 
-def load_card_names() -> list[str]:
+def read_card_map_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".csv":
+        with path.open(newline="", encoding="utf-8-sig") as file_obj:
+            return list(csv.DictReader(file_obj))
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    return [row for row in payload if isinstance(row, dict)]
+
+
+def resolve_resource_path(raw_path: str) -> Path | None:
+    if not raw_path:
+        return None
+    candidate = Path(raw_path)
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+    for base_dir in (APP_DIR, RESOURCE_DIR):
+        path = base_dir / raw_path
+        if path.exists():
+            return path
+    return None
+
+
+def load_card_catalog() -> dict[str, CardInfo]:
     for path in iter_card_map_paths():
         if not path.exists():
             continue
-        names: set[str] = set()
-        if path.suffix.lower() == ".csv":
-            with path.open(newline="", encoding="utf-8-sig") as file_obj:
-                for row in csv.DictReader(file_obj):
-                    name = (row.get("zh_name") or "").strip()
-                    if name:
-                        names.add(name)
-        else:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-            for row in payload:
-                name = (row.get("zh_name") or "").strip()
-                if name:
-                    names.add(name)
-        if names:
-            return sorted(names, key=lambda item: (-len(item), item))
-    return []
+        catalog: dict[str, CardInfo] = {}
+        for row in read_card_map_rows(path):
+            name = (row.get("zh_name") or "").strip()
+            if not name or name in catalog:
+                continue
+            image_path = resolve_resource_path((row.get("image_path") or "").strip())
+            catalog[name] = CardInfo(
+                name=name,
+                image_path=image_path,
+                description=(row.get("zh_description") or "").strip(),
+                flavor=(row.get("zh_flavor") or "").strip(),
+                card_type=(row.get("card_type_zh") or "").strip(),
+            )
+        if catalog:
+            return catalog
+    return {}
+
+
+def load_card_names() -> list[str]:
+    return sorted(load_card_catalog(), key=lambda item: (-len(item), item))
 
 
 def extract_card_name_items(text: str, card_names: list[str]) -> Counter[str]:
@@ -543,15 +577,20 @@ class GremlinsAssistantApp:
         self.stop_event: threading.Event | None = None
         self.worker: CaptureWorker | None = None
         self.ocr_engine = OcrEngine()
-        self.card_names = load_card_names()
+        self.card_catalog = load_card_catalog()
+        self.card_names = sorted(self.card_catalog, key=lambda item: (-len(item), item))
         self.counter: Counter[str] = Counter()
         self.records: list[CaptureRecord] = []
         self.last_text = ""
+        self.overlay_button: tk.Toplevel | None = None
+        self.used_cards_window: tk.Toplevel | None = None
+        self.card_photo_cache: dict[str, ImageTk.PhotoImage] = {}
 
         self._build_ui()
         self.refresh_windows(initial=True)
         self.root.after(200, self._drain_events)
         self.root.after(1000, self._poll_target_application)
+        self.root.after(1200, self._update_overlay_button)
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -856,6 +895,239 @@ class GremlinsAssistantApp:
         if self.roi_mode_var.get() == ROI_MODE_BOTTOM_CARD:
             self.apply_bottom_card_preset()
         self.status_var.set("窗口已锁定，接下来可以测试 OCR 或开始监控。")
+        self.show_overlay_button()
+
+    def _target_window_rect(self) -> tuple[int, int, int, int] | None:
+        hwnd = self.config.selected_hwnd
+        if not hwnd or not is_window_alive(hwnd):
+            return None
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return None
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
+
+    def show_overlay_button(self) -> None:
+        if self.overlay_button and self.overlay_button.winfo_exists():
+            self._position_overlay_button()
+            return
+
+        button_window = tk.Toplevel(self.root)
+        button_window.title("已用卡牌")
+        button_window.overrideredirect(True)
+        button_window.attributes("-topmost", True)
+        button_window.attributes("-toolwindow", True)
+        button_window.configure(bg="#2b2118")
+
+        button = tk.Button(
+            button_window,
+            text="牌",
+            width=3,
+            height=1,
+            command=self.toggle_used_cards_window,
+            bg="#f1c66a",
+            fg="#2b2118",
+            activebackground="#ffe08a",
+            activeforeground="#2b2118",
+            relief=tk.RAISED,
+            bd=2,
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+        button.pack(ipadx=4, ipady=2)
+        self.overlay_button = button_window
+        self._position_overlay_button()
+
+    def _position_overlay_button(self) -> None:
+        if not self.overlay_button or not self.overlay_button.winfo_exists():
+            return
+        rect = self._target_window_rect()
+        if rect is None:
+            self.overlay_button.withdraw()
+            return
+        left, top, right, _ = rect
+        self.overlay_button.deiconify()
+        width, height = 46, 34
+        x = max(left + 8, right - width - 18)
+        y = top + 42
+        self.overlay_button.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _update_overlay_button(self) -> None:
+        if self.config.selected_hwnd:
+            self.show_overlay_button()
+            if self.used_cards_window and self.used_cards_window.winfo_exists():
+                self._position_used_cards_window()
+        self.root.after(700, self._update_overlay_button)
+
+    def toggle_used_cards_window(self) -> None:
+        if self.used_cards_window and self.used_cards_window.winfo_exists():
+            self.used_cards_window.destroy()
+            self.used_cards_window = None
+            return
+        self.show_used_cards_window()
+
+    def show_used_cards_window(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("已使用卡牌")
+        window.attributes("-topmost", True)
+        window.attributes("-toolwindow", True)
+        window.configure(bg="#2b2118")
+        window.protocol("WM_DELETE_WINDOW", self.close_used_cards_window)
+        self.used_cards_window = window
+        self._position_used_cards_window()
+        self.refresh_used_cards_window()
+
+    def close_used_cards_window(self) -> None:
+        if self.used_cards_window and self.used_cards_window.winfo_exists():
+            self.used_cards_window.destroy()
+        self.used_cards_window = None
+
+    def _position_used_cards_window(self) -> None:
+        if not self.used_cards_window or not self.used_cards_window.winfo_exists():
+            return
+        rect = self._target_window_rect()
+        if rect is None:
+            return
+        left, top, right, bottom = rect
+        game_width = right - left
+        game_height = bottom - top
+        width = min(720, max(430, game_width // 3))
+        height = min(620, max(360, game_height - 110))
+        x = right - width - 22
+        y = top + 82
+        self.used_cards_window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def refresh_used_cards_window(self) -> None:
+        window = self.used_cards_window
+        if not window or not window.winfo_exists():
+            return
+        for child in window.winfo_children():
+            child.destroy()
+
+        header = tk.Frame(window, bg="#2b2118")
+        header.pack(fill=tk.X, padx=10, pady=(10, 6))
+        total = sum(self.counter.values())
+        tk.Label(
+            header,
+            text=f"已使用卡牌  {total}",
+            bg="#2b2118",
+            fg="#f7e7bf",
+            font=("Microsoft YaHei UI", 13, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Button(
+            header,
+            text="×",
+            command=self.close_used_cards_window,
+            bg="#5a3826",
+            fg="#f7e7bf",
+            activebackground="#7a4b2f",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            width=3,
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(side=tk.RIGHT)
+
+        canvas = tk.Canvas(window, bg="#2b2118", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(window, orient=tk.VERTICAL, command=canvas.yview)
+        body = tk.Frame(canvas, bg="#2b2118")
+        body.bind(
+            "<Configure>",
+            lambda _: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=(0, 10))
+
+        if not self.counter:
+            tk.Label(
+                body,
+                text="还没有识别到已使用卡牌",
+                bg="#2b2118",
+                fg="#d7c8a5",
+                font=("Microsoft YaHei UI", 11),
+            ).pack(anchor="w", padx=8, pady=18)
+            return
+
+        for card_name, count in self.counter.most_common():
+            self._add_used_card_row(body, card_name, count)
+
+    def _add_used_card_row(self, parent: tk.Widget, card_name: str, count: int) -> None:
+        info = self.card_catalog.get(card_name, CardInfo(name=card_name, image_path=None))
+        row = tk.Frame(parent, bg="#3a2a1e", highlightbackground="#b47a33", highlightthickness=1)
+        row.pack(fill=tk.X, padx=2, pady=5)
+
+        image_label = tk.Label(row, bg="#3a2a1e")
+        image_label.pack(side=tk.LEFT, padx=8, pady=8)
+        photo = self._get_card_photo(card_name, info.image_path)
+        if photo:
+            image_label.configure(image=photo)
+            image_label.image = photo
+        else:
+            image_label.configure(
+                text="无图",
+                fg="#f7e7bf",
+                width=10,
+                height=5,
+                font=("Microsoft YaHei UI", 10),
+            )
+
+        text_frame = tk.Frame(row, bg="#3a2a1e")
+        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8), pady=8)
+
+        title = tk.Frame(text_frame, bg="#3a2a1e")
+        title.pack(fill=tk.X)
+        tk.Label(
+            title,
+            text=card_name,
+            bg="#3a2a1e",
+            fg="#fff1c6",
+            anchor="w",
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            title,
+            text=f"×{count}",
+            bg="#c88a2c",
+            fg="#24180f",
+            padx=8,
+            pady=1,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side=tk.RIGHT)
+
+        meta = info.card_type or "卡牌"
+        tk.Label(
+            text_frame,
+            text=meta,
+            bg="#3a2a1e",
+            fg="#d7c8a5",
+            anchor="w",
+            font=("Microsoft YaHei UI", 9),
+        ).pack(fill=tk.X, pady=(2, 0))
+
+        if info.description:
+            tk.Label(
+                text_frame,
+                text=info.description,
+                bg="#3a2a1e",
+                fg="#f4e6c2",
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=430,
+                font=("Microsoft YaHei UI", 9),
+            ).pack(fill=tk.X, pady=(4, 0))
+
+    def _get_card_photo(self, card_name: str, image_path: Path | None) -> ImageTk.PhotoImage | None:
+        if card_name in self.card_photo_cache:
+            return self.card_photo_cache[card_name]
+        if not image_path or not image_path.exists():
+            return None
+        image = Image.open(image_path).convert("RGB")
+        image.thumbnail((92, 130), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        self.card_photo_cache[card_name] = photo
+        return photo
 
     def capture_once(self) -> None:
         if not self.config.selected_hwnd:
@@ -984,6 +1256,10 @@ class GremlinsAssistantApp:
         self.stop_monitoring()
         if self.worker and self.worker.is_alive():
             self.worker.join(timeout=1.5)
+        if self.overlay_button and self.overlay_button.winfo_exists():
+            self.overlay_button.destroy()
+        if self.used_cards_window and self.used_cards_window.winfo_exists():
+            self.used_cards_window.destroy()
         save_config(self.config)
         self.root.destroy()
 
@@ -1033,6 +1309,7 @@ class GremlinsAssistantApp:
             self.worker.current_seen_signature = ""
         self.text_output.delete("1.0", tk.END)
         self.counter_output.delete("1.0", tk.END)
+        self.refresh_used_cards_window()
         self.status_var.set("统计结果已清空。")
 
     def export_results(self) -> None:
@@ -1128,6 +1405,8 @@ class GremlinsAssistantApp:
         if duplicate:
             status += "，这张卡牌画面仍在持续显示，已跳过重复累计。"
         self.status_var.set(status)
+        if items_counted or (self.used_cards_window and self.used_cards_window.winfo_exists()):
+            self.refresh_used_cards_window()
 
 
 def truncate_text(value: str, limit: int = 28) -> str:

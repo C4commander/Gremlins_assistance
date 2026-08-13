@@ -12,3 +12,12 @@ config.json
 card_images_full/
 gremlinopedia_images/
 
+card_image_text_map.json
+card_image_text_map_preview_zh.txt
+disasm_*.py
+disasm_*.txt
+dump_*.py
+find_*.py
+generate_card_image_text_map.py
+inspect_*.py
+probe_*.py

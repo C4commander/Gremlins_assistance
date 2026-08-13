@@ -9,6 +9,8 @@ datas = collect_data_files("rapidocr_onnxruntime")
 for card_map_name in ("card_image_text_map.csv", "card_image_text_map.json"):
     if os.path.exists(card_map_name):
         datas.append((card_map_name, "."))
+if os.path.isdir("card_images_full"):
+    datas.append(("card_images_full", "card_images_full"))
 hiddenimports = collect_submodules("rapidocr_onnxruntime")
 exe_name = os.environ.get("GREMLINS_BUILD_NAME", "Gremlins_assistance")
 
