@@ -29,6 +29,11 @@ import win32ui
 PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
 SRCCOPY = 0x00CC0020
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
 CHINESE_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 APP_DIR = (
@@ -114,13 +119,38 @@ DEFAULT_DECK_COUNTER_RELATIVE_ROI = {
     "width": 0.055,
     "height": 0.15,
 }
+# The central panel is normally uncovered during a live match. It provides
+# a guard against menu, encyclopedia, settings, and result dialogs.
+DEFAULT_GAME_STATE_RELATIVE_ROI = {
+    "x": 0.22,
+    "y": 0.10,
+    "width": 0.56,
+    "height": 0.66,
+}
+GAME_STATE_CONFIRMATIONS = 2
+BLOCKING_SCREEN_PHRASES = (
+    "单人游戏",
+    "多人游戏",
+    "自定义赛局",
+    "训练赛局",
+    "加载赛局",
+    "开始挑战",
+    "游戏规则",
+    "小魔怪百科",
+    "制作名单",
+    "退出游戏",
+    "暂停游戏",
+    "游戏设置",
+    "比赛结束",
+    "重新连接",
+)
 NORMAL_DECK_SIZE = 189
 MISFORTUNE_DECK_SIZE = 40
 DECK_COUNTER_CONFIRMATIONS = 2
 CARD_TILE_WIDTH = 96
 CARD_TILE_HEIGHT = 172
 CARD_TILE_GUTTER = 6
-DEFAULT_CAPTURE_INTERVAL_SECONDS = 0.5
+DEFAULT_CAPTURE_INTERVAL_SECONDS = 0.01
 BOTTOM_CARD_NOISE_PHRASES = (
     "使用卡牌时会发生什么",
     "选择表现",
@@ -155,6 +185,8 @@ class AppConfig:
     target_keyword: str = DEFAULT_TARGET_KEYWORD
     auto_detect_enabled: bool = True
     auto_lock_detected: bool = True
+    auto_reset_on_deck_recycle: bool = False
+    important_cards: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -192,6 +224,9 @@ def load_config() -> AppConfig:
         return AppConfig()
     try:
         payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        raw_important_cards = payload.get("important_cards", [])
+        if not isinstance(raw_important_cards, list):
+            raw_important_cards = []
         roi_data = payload.get("roi", {})
         roi = Roi(
             x=int(roi_data.get("x", DEFAULT_CARD_ROI["x"])),
@@ -222,6 +257,16 @@ def load_config() -> AppConfig:
             ),
             auto_detect_enabled=bool(payload.get("auto_detect_enabled", True)),
             auto_lock_detected=bool(payload.get("auto_lock_detected", True)),
+            auto_reset_on_deck_recycle=bool(
+                payload.get("auto_reset_on_deck_recycle", False)
+            ),
+            important_cards=list(
+                dict.fromkeys(
+                    name.strip()
+                    for name in raw_important_cards
+                    if isinstance(name, str) and name.strip()
+                )
+            ),
         )
     except (ValueError, OSError, TypeError):
         return AppConfig()
@@ -423,11 +468,40 @@ def resolve_deck_counter_roi(image: np.ndarray) -> Roi:
     )
 
 
+def resolve_game_state_roi(image: np.ndarray) -> Roi:
+    return relative_roi_to_absolute(
+        image,
+        RelativeRoi(**DEFAULT_GAME_STATE_RELATIVE_ROI),
+    )
+
+
 def prepare_ocr_image(image: np.ndarray) -> np.ndarray:
     scaled = cv2.resize(image, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(scaled, cv2.COLOR_RGB2GRAY)
+    lab = cv2.cvtColor(scaled, cv2.COLOR_RGB2LAB)
+    lightness, channel_a, channel_b = cv2.split(lab)
+    lightness = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8)).apply(lightness)
+    enhanced = cv2.cvtColor(
+        cv2.merge((lightness, channel_a, channel_b)), cv2.COLOR_LAB2RGB
+    )
+    gray = cv2.cvtColor(enhanced, cv2.COLOR_RGB2GRAY)
     sharpened = cv2.addWeighted(gray, 1.6, cv2.GaussianBlur(gray, (0, 0), 1.2), -0.6, 0)
     return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
+
+
+def prepare_high_contrast_ocr_image(image: np.ndarray) -> np.ndarray:
+    """Fallback for card titles whose color is close to the card background."""
+    scaled = cv2.resize(image, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(scaled, cv2.COLOR_RGB2GRAY)
+    gray = cv2.createCLAHE(clipLimit=3.2, tileGridSize=(8, 8)).apply(gray)
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        35,
+        5,
+    )
+    return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
 
 
 def make_roi_visual_signature(image: np.ndarray) -> np.ndarray:
@@ -481,6 +555,14 @@ def extract_deck_counts(lines: list[str]) -> dict[str, int] | None:
 
 def normalize_card_match_text(raw_text: str) -> str:
     return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", raw_text).lower()
+
+
+def is_blocking_game_screen(text: str) -> bool:
+    normalized = normalize_card_match_text(text)
+    return any(
+        normalize_card_match_text(phrase) in normalized
+        for phrase in BLOCKING_SCREEN_PHRASES
+    )
 
 
 def iter_card_map_paths(filenames: tuple[str, ...]) -> list[Path]:
@@ -628,6 +710,26 @@ class OcrEngine:
         return normalize_text(lines), lines
 
 
+def read_card_text(
+    ocr_engine: OcrEngine,
+    image: np.ndarray,
+    card_names: list[str],
+    clean_card_area: bool = False,
+) -> tuple[str, Counter[str]]:
+    text, _ = ocr_engine.read_text(prepare_ocr_image(image))
+    if clean_card_area:
+        text = clean_card_area_text(text)
+    matched_items = extract_card_name_items(text, card_names)
+    if matched_items:
+        return text, matched_items
+
+    fallback_text, _ = ocr_engine.read_text(prepare_high_contrast_ocr_image(image))
+    if clean_card_area:
+        fallback_text = clean_card_area_text(fallback_text)
+    fallback_items = extract_card_name_items(fallback_text, card_names)
+    return (fallback_text, fallback_items) if fallback_items else (text, matched_items)
+
+
 class CaptureWorker(threading.Thread):
     def __init__(
         self,
@@ -668,6 +770,13 @@ class CaptureWorker(threading.Thread):
             "normal": None,
             "misfortune": None,
         }
+        self.previous_game_state_signature: np.ndarray | None = None
+        self.game_state_stable_samples = 0
+        self.game_state_generation = 0
+        self.checked_game_state_generation = -1
+        self.gameplay_state_known = False
+        self.game_screen_blocked = True
+        self.resume_card_baseline_pending = True
 
     def _clear_counter_scopes(self, scopes: tuple[str, ...]) -> None:
         for name in list(self.counter):
@@ -703,7 +812,9 @@ class CaptureWorker(threading.Thread):
 
         if not updated_scopes:
             return None
-        reset_scope_tuple = tuple(reset_scopes)
+        reset_scope_tuple = (
+            tuple(reset_scopes) if self.config.auto_reset_on_deck_recycle else ()
+        )
         if reset_scope_tuple:
             self._clear_counter_scopes(reset_scope_tuple)
         return {
@@ -732,17 +843,78 @@ class CaptureWorker(threading.Thread):
         counts = extract_deck_counts(lines)
         return self._observe_deck_counts(counts) if counts else None
 
+    def _capture_game_state(self, frame: np.ndarray) -> dict[str, Any] | None:
+        state_frame, _ = clamp_roi(frame, resolve_game_state_roi(frame))
+        signature = make_roi_visual_signature(state_frame)
+        if is_visually_unchanged(self.previous_game_state_signature, signature):
+            self.game_state_stable_samples += 1
+        else:
+            self.previous_game_state_signature = signature
+            self.game_state_stable_samples = 1
+            self.game_state_generation += 1
+
+        if (
+            self.game_state_stable_samples < GAME_STATE_CONFIRMATIONS
+            or self.checked_game_state_generation == self.game_state_generation
+        ):
+            return None
+
+        self.checked_game_state_generation = self.game_state_generation
+        text, _ = self.ocr_engine.read_text(prepare_ocr_image(state_frame))
+        blocked = is_blocking_game_screen(text)
+        previous_blocked = self.game_screen_blocked
+        previous_known = self.gameplay_state_known
+        self.gameplay_state_known = True
+        self.game_screen_blocked = blocked
+
+        if blocked:
+            self.previous_roi_signature = None
+            self.previous_deck_signature = None
+            self.deck_candidate_samples = {"normal": 0, "misfortune": 0}
+        elif not previous_known or previous_blocked:
+            # Do not count the first visible card after a dialog closes.
+            self.resume_card_baseline_pending = True
+
+        if not previous_known or blocked != previous_blocked:
+            return {
+                "type": "game_state",
+                "blocked": blocked,
+                "text": text,
+            }
+        return None
+
     def run(self) -> None:
         while not self.stop_event.is_set():
             started_at = time.perf_counter()
             try:
                 frame = capture_window_client(self.hwnd)
+                state_event = self._capture_game_state(frame)
+                if state_event:
+                    self.events.put(state_event)
+                if not self.gameplay_state_known or self.game_screen_blocked:
+                    elapsed = time.perf_counter() - started_at
+                    if self.stop_event.wait(
+                        max(0.01, self.config.interval_seconds - elapsed)
+                    ):
+                        break
+                    continue
+
                 deck_event = self._capture_deck_update(frame)
                 if deck_event:
                     self.events.put(deck_event)
                 active_roi = resolve_roi(self.config, frame)
                 roi_frame, roi_bounds = clamp_roi(frame, active_roi)
                 roi_signature = make_roi_visual_signature(roi_frame)
+                if self.resume_card_baseline_pending:
+                    self.previous_roi_signature = roi_signature
+                    self.resume_card_baseline_pending = False
+                    self.failure_count = 0
+                    elapsed = time.perf_counter() - started_at
+                    if self.stop_event.wait(
+                        max(0.01, self.config.interval_seconds - elapsed)
+                    ):
+                        break
+                    continue
                 force_card_ocr = bool(deck_event and deck_event["reset_scopes"])
                 if (
                     not force_card_ocr
@@ -751,15 +923,17 @@ class CaptureWorker(threading.Thread):
                     self.failure_count = 0
                     elapsed = time.perf_counter() - started_at
                     if self.stop_event.wait(
-                        max(0.1, self.config.interval_seconds - elapsed)
+                        max(0.01, self.config.interval_seconds - elapsed)
                     ):
                         break
                     continue
                 self.previous_roi_signature = roi_signature
-                text, _ = self.ocr_engine.read_text(prepare_ocr_image(roi_frame))
-                if self.config.roi_mode == ROI_MODE_BOTTOM_CARD:
-                    text = clean_card_area_text(text)
-                matched_items = extract_card_name_items(text, self.card_names)
+                text, matched_items = read_card_text(
+                    self.ocr_engine,
+                    roi_frame,
+                    self.card_names,
+                    self.config.roi_mode == ROI_MODE_BOTTOM_CARD,
+                )
                 signature = card_match_signature(matched_items, text)
                 should_count = bool(matched_items)
                 duplicate = should_count and signature == self.current_seen_signature
@@ -803,7 +977,7 @@ class CaptureWorker(threading.Thread):
                 )
 
             elapsed = time.perf_counter() - started_at
-            sleep_for = max(0.1, self.config.interval_seconds - elapsed)
+            sleep_for = max(0.01, self.config.interval_seconds - elapsed)
             if self.stop_event.wait(sleep_for):
                 break
 
@@ -846,6 +1020,7 @@ class GremlinsAssistantApp:
         self.summary_ocr_var = tk.StringVar(value="暂无识别结果")
         self.summary_count_var = tk.StringVar(value="累计 0 次卡牌名称")
         self.card_summary_vars = {
+            "all": tk.StringVar(value="卡牌使用情况"),
             "normal": tk.StringVar(value="普通卡牌使用情况"),
             "misfortune": tk.StringVar(value="厄运卡牌使用情况"),
         }
@@ -855,6 +1030,7 @@ class GremlinsAssistantApp:
         self.ocr_engine = OcrEngine()
         self.card_catalog = load_card_catalog(include_supplemental_entries=True)
         self.misfortune_catalog = load_card_catalog(MISFORTUNE_MAP_FILENAMES)
+        self.important_cards = set(self.config.important_cards)
         self.location_group_var = tk.StringVar(value="全部")
         self.card_names = sorted(
             set(self.card_catalog) | set(self.misfortune_catalog),
@@ -862,10 +1038,9 @@ class GremlinsAssistantApp:
         )
         self.counter: Counter[str] = Counter()
         self.misfortune_counter: Counter[str] = Counter()
+        self.latest_triggered_cards: tuple[str, ...] = ()
         self.records: list[CaptureRecord] = []
         self.last_text = ""
-        self.overlay_button: tk.Toplevel | None = None
-        self.used_cards_window: tk.Toplevel | None = None
         self.card_photo_cache: dict[tuple[str, bool, int, int], ImageTk.PhotoImage] = {}
         self.card_notebook: ttk.Notebook | None = None
         self.card_panels: dict[str, dict[str, Any]] = {}
@@ -878,7 +1053,7 @@ class GremlinsAssistantApp:
         self.refresh_windows(initial=True)
         self.root.after(200, self._drain_events)
         self.root.after(1000, self._poll_target_application)
-        self.root.after(1200, self._update_overlay_button)
+        self.root.after(1200, self.dock_to_target_window)
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root)
@@ -886,132 +1061,18 @@ class GremlinsAssistantApp:
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(1, weight=1)
 
-        panes = ttk.PanedWindow(outer, orient=tk.VERTICAL)
-        panes.grid(row=1, column=0, sticky="nsew")
-        self.main_panes = panes
-
-        settings_pane = ttk.Frame(panes)
-        settings_pane.columnconfigure(0, weight=1)
-        settings_pane.rowconfigure(0, weight=1)
-        self.main_canvas = tk.Canvas(settings_pane, highlightthickness=0)
-        main_scrollbar = ttk.Scrollbar(
-            settings_pane, orient=tk.VERTICAL, command=self.main_canvas.yview
-        )
-        main = ttk.Frame(self.main_canvas, padding=12)
-        main.bind(
-            "<Configure>",
-            lambda _: self.main_canvas and self.main_canvas.configure(
-                scrollregion=self.main_canvas.bbox("all")
-            ),
-        )
-        main_window = self.main_canvas.create_window((0, 0), window=main, anchor="nw")
-        self.main_canvas.bind(
-            "<Configure>",
-            lambda event: self.main_canvas and self.main_canvas.itemconfigure(
-                main_window, width=event.width
-            ),
-        )
-        self.main_canvas.configure(yscrollcommand=main_scrollbar.set)
-        self.main_canvas.grid(row=0, column=0, sticky="nsew")
-        main_scrollbar.grid(row=0, column=1, sticky="ns")
-        panes.add(settings_pane, weight=1)
-        main.columnconfigure(0, weight=1)
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(1, weight=1)
-
-        top_frame = ttk.LabelFrame(main, text="1. 选择并锁定窗口", padding=12)
-        top_frame.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 12))
-        top_frame.columnconfigure(2, weight=1)
-
-        ttk.Button(
-            top_frame,
-            text="手动选择并锁定窗口",
-            command=self.open_window_picker,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Button(top_frame, text="单次识别", command=self.capture_once).grid(
-            row=0, column=1, sticky="w", padx=(8, 0)
-        )
-        ttk.Label(top_frame, textvariable=self.locked_window_var).grid(
-            row=0, column=2, sticky="e", padx=(12, 0)
-        )
-
-        detect_frame = ttk.Frame(top_frame)
-        detect_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        detect_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(detect_frame, text="目标关键词").grid(row=0, column=0, sticky="w")
-        ttk.Entry(detect_frame, textvariable=self.target_keyword_var).grid(
-            row=0, column=1, sticky="ew", padx=(8, 8)
-        )
-        ttk.Checkbutton(
-            detect_frame,
-            text="自动检测是否开启",
-            variable=self.auto_detect_var,
-        ).grid(row=0, column=2, sticky="w")
-        ttk.Checkbutton(
-            detect_frame,
-            text="自动锁定检测到的窗口",
-            variable=self.auto_lock_var,
-        ).grid(row=0, column=3, sticky="w", padx=(8, 0))
-        ttk.Label(detect_frame, textvariable=self.detected_status_var).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0)
-        )
-
-        overview_frame = ttk.LabelFrame(top_frame, text="现状总览", padding=10)
-        overview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        overview_frame.columnconfigure(1, weight=1)
-        overview_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(overview_frame, text="目标程序").grid(row=0, column=0, sticky="w")
-        ttk.Label(overview_frame, textvariable=self.summary_target_var).grid(
-            row=0, column=1, sticky="w", padx=(8, 16)
-        )
-        ttk.Label(overview_frame, text="锁定窗口").grid(row=0, column=2, sticky="w")
-        ttk.Label(overview_frame, textvariable=self.summary_lock_var).grid(
-            row=0, column=3, sticky="w", padx=(8, 0)
-        )
-        ttk.Label(overview_frame, text="监控状态").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(overview_frame, textvariable=self.summary_monitor_var).grid(
-            row=1, column=1, sticky="w", padx=(8, 16), pady=(6, 0)
-        )
-        ttk.Label(overview_frame, text="最近 OCR").grid(row=1, column=2, sticky="w", pady=(6, 0))
-        ttk.Label(overview_frame, textvariable=self.summary_ocr_var).grid(
-            row=1, column=3, sticky="w", padx=(8, 0), pady=(6, 0)
-        )
-        ttk.Label(overview_frame, text="累计计数").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(overview_frame, textvariable=self.summary_count_var).grid(
-            row=2, column=1, sticky="w", padx=(8, 16), pady=(6, 0)
-        )
-        top_frame.grid_remove()
-
-        control_frame = ttk.LabelFrame(main, text="2. 采集参数", padding=12)
-        control_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        control_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(control_frame, text="采集间隔(秒)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(control_frame, textvariable=self.interval_var).grid(
-            row=0, column=1, sticky="ew"
-        )
-
-        result_frame = ttk.LabelFrame(main, text="3. 识别到的卡牌", padding=12)
-        result_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        result_frame.columnconfigure(0, weight=1)
-        result_frame.rowconfigure(1, weight=1)
-
-        ttk.Label(result_frame, text="最近识别内容").grid(row=0, column=0, sticky="w")
-        self.text_output = tk.Text(result_frame, width=32, height=10, wrap="word")
-        self.text_output.grid(row=1, column=0, sticky="nsew")
-
-        cards_frame = ttk.LabelFrame(panes, text="4. 卡牌使用情况", padding=8)
+        cards_frame = ttk.LabelFrame(outer, text="卡牌使用情况", padding=8)
+        cards_frame.grid(row=1, column=0, sticky="nsew")
         cards_frame.columnconfigure(0, weight=1)
         cards_frame.rowconfigure(0, weight=1)
 
         self.card_notebook = ttk.Notebook(cards_frame)
         self.card_notebook.grid(row=0, column=0, sticky="nsew")
-        self._create_card_panel("normal", "普通卡牌 (192 张)")
-        self._create_card_panel("misfortune", "厄运卡牌 (40 张)")
-        panes.add(cards_frame, weight=1)
-        self.root.after_idle(self._prioritize_card_panel)
+        self._create_card_panel("normal", "普通卡牌")
+        self._create_card_panel("misfortune", "厄运卡牌")
+        # Keep recognition text available to the monitoring workflow without
+        # exposing OCR internals in the user-facing interface.
+        self.text_output = tk.Text(self.root)
 
         action_bar = ttk.Frame(outer, padding=(12, 8))
         action_bar.grid(row=0, column=0, sticky="ew")
@@ -1020,8 +1081,8 @@ class GremlinsAssistantApp:
         action_buttons = (
             ("开始监控", self.start_monitoring),
             ("停止监控", self.stop_monitoring),
-            ("清空计数", self.reset_counts),
-            ("预览识别范围", self.preview_roi),
+            ("清空本局统计", self.reset_counts),
+            ("管理重点卡牌", self.open_important_cards_manager),
         )
         for index, (label, command) in enumerate(action_buttons):
             ttk.Button(action_bar, text=label, command=command).grid(
@@ -1146,7 +1207,7 @@ class GremlinsAssistantApp:
                 width=int(self.roi_width_var.get()),
                 height=int(self.roi_height_var.get()),
             )
-            interval_seconds = max(0.2, float(self.interval_var.get()))
+            interval_seconds = max(0.01, float(self.interval_var.get()))
         except ValueError as exc:
             raise ValueError("ROI 和采集间隔必须是有效数字。") from exc
 
@@ -1160,6 +1221,8 @@ class GremlinsAssistantApp:
             target_keyword=self.target_keyword_var.get().strip(),
             auto_detect_enabled=self.auto_detect_var.get(),
             auto_lock_detected=self.auto_lock_var.get(),
+            auto_reset_on_deck_recycle=self.config.auto_reset_on_deck_recycle,
+            important_cards=sorted(self.important_cards),
         )
 
     def apply_bottom_card_preset(self) -> None:
@@ -1197,7 +1260,7 @@ class GremlinsAssistantApp:
         if self.roi_mode_var.get() == ROI_MODE_BOTTOM_CARD:
             self.apply_bottom_card_preset()
         self.status_var.set("窗口已锁定，接下来可以测试 OCR 或开始监控。")
-        self.show_overlay_button()
+        self.dock_to_target_window()
 
     def _target_window_rect(self) -> tuple[int, int, int, int] | None:
         hwnd = self.config.selected_hwnd
@@ -1210,6 +1273,27 @@ class GremlinsAssistantApp:
         if right <= left or bottom <= top:
             return None
         return left, top, right, bottom
+
+    def dock_to_target_window(self) -> None:
+        """Place the main helper beside the windowed game, never over its content."""
+        rect = self._target_window_rect()
+        if rect is None:
+            return
+        left, top, right, bottom = rect
+        game_width = right - left
+        game_height = bottom - top
+        virtual_left = self.root.winfo_vrootx()
+        virtual_top = self.root.winfo_vrooty()
+        virtual_right = virtual_left + self.root.winfo_vrootwidth()
+        virtual_bottom = virtual_top + self.root.winfo_vrootheight()
+        width = min(560, max(440, game_width // 3))
+        height = min(max(600, game_height), max(600, virtual_bottom - virtual_top - 40))
+        x = right + 12
+        if x + width > virtual_right:
+            x = max(virtual_left, left - width - 12)
+        y = max(virtual_top, min(top, virtual_bottom - height))
+        self.root.attributes("-topmost", False)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def show_overlay_button(self) -> None:
         if self.overlay_button and self.overlay_button.winfo_exists():
@@ -1240,6 +1324,8 @@ class GremlinsAssistantApp:
         button.pack(ipadx=4, ipady=2)
         self.overlay_button = button_window
         self._position_overlay_button()
+        self._make_topmost_without_activation(button_window)
+        self.root.after(60, self._restore_game_foreground)
 
     def _position_overlay_button(self) -> None:
         if not self.overlay_button or not self.overlay_button.winfo_exists():
@@ -1254,6 +1340,27 @@ class GremlinsAssistantApp:
         x = max(left + 8, right - width - 18)
         y = top + 42
         self.overlay_button.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _make_topmost_without_activation(self, window: tk.Toplevel) -> None:
+        """Keep an overlay above the game without stealing its keyboard focus."""
+        window.update_idletasks()
+        USER32.SetWindowPos(
+            window.winfo_id(),
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+
+    def _restore_game_foreground(self) -> None:
+        hwnd = self.config.selected_hwnd
+        if hwnd and is_window_alive(hwnd):
+            try:
+                USER32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
 
     def _update_overlay_button(self) -> None:
         if self.config.selected_hwnd:
@@ -1369,13 +1476,34 @@ class GremlinsAssistantApp:
     def _update_overlay_button(self) -> None:
         if self.config.selected_hwnd:
             self.show_overlay_button()
+            if self.used_cards_window and self.used_cards_window.winfo_exists():
+                self._position_used_cards_window()
         self.root.after(700, self._update_overlay_button)
 
     def toggle_used_cards_window(self) -> None:
-        self.focus_card_panel()
+        if self.used_cards_window and self.used_cards_window.winfo_exists():
+            self.close_used_cards_window()
+            return
+        self.show_used_cards_window()
 
     def show_used_cards_window(self) -> None:
-        self.focus_card_panel()
+        if self.used_cards_window and self.used_cards_window.winfo_exists():
+            self.refresh_used_cards_window()
+            self._make_topmost_without_activation(self.used_cards_window)
+            self.root.after(60, self._restore_game_foreground)
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("卡牌使用情况")
+        window.attributes("-topmost", True)
+        window.attributes("-toolwindow", True)
+        window.configure(bg="#2b2118")
+        window.protocol("WM_DELETE_WINDOW", self.close_used_cards_window)
+        self.used_cards_window = window
+        self._position_used_cards_window()
+        self.refresh_used_cards_window()
+        self._make_topmost_without_activation(window)
+        self.root.after(60, self._restore_game_foreground)
 
     def close_used_cards_window(self) -> None:
         if self.used_cards_window and self.used_cards_window.winfo_exists():
@@ -1383,7 +1511,86 @@ class GremlinsAssistantApp:
         self.used_cards_window = None
 
     def refresh_used_cards_window(self) -> None:
-        self.refresh_card_panel()
+        window = self.used_cards_window
+        if not window or not window.winfo_exists():
+            return
+        for child in window.winfo_children():
+            child.destroy()
+
+        header = tk.Frame(window, bg="#2b2118")
+        header.pack(fill=tk.X, padx=10, pady=(10, 6))
+        tk.Label(
+            header,
+            text="卡牌使用情况",
+            bg="#2b2118",
+            fg="#f7e7bf",
+            font=("Microsoft YaHei UI", 13, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Button(
+            header,
+            text="X",
+            command=self.close_used_cards_window,
+            bg="#5a3826",
+            fg="#f7e7bf",
+            activebackground="#7a4b2f",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            width=3,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side=tk.RIGHT)
+
+        canvas = tk.Canvas(window, bg="#2b2118", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(window, orient=tk.VERTICAL, command=canvas.yview)
+        body = tk.Frame(canvas, bg="#2b2118")
+        body.bind(
+            "<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(body_window, width=event.width),
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=(0, 10))
+
+        for section, title in (("normal", "普通卡牌"), ("misfortune", "厄运卡牌")):
+            counts = self._canonical_card_counts(section)
+            cards = [
+                info
+                for info in self._catalog_cards(section)
+                if counts.get(info.name, 0) > 0 or info.name in self.important_cards
+            ]
+            section_frame = tk.Frame(body, bg="#2b2118")
+            section_frame.pack(fill=tk.X, pady=(0, 12))
+            tk.Label(
+                section_frame,
+                text=f"{title}  已使用 {sum(count > 0 for count in counts.values())} 张",
+                bg="#2b2118",
+                fg="#f1c66a",
+                anchor="w",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            ).grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 4))
+            for column in range(4):
+                section_frame.columnconfigure(column, weight=1, uniform=section)
+            if not cards:
+                tk.Label(
+                    section_frame,
+                    text="暂无已使用或重点卡牌",
+                    bg="#2b2118",
+                    fg="#b8b8b8",
+                    anchor="w",
+                ).grid(row=1, column=0, columnspan=4, sticky="w", padx=4)
+                continue
+            for index, info in enumerate(cards):
+                self._add_card_status_tile(
+                    section_frame,
+                    info,
+                    counts.get(info.name, 0),
+                    row=index // 4 + 1,
+                    column=index % 4,
+                    compact=True,
+                )
 
     def _create_card_panel(self, scope: str, tab_title: str) -> None:
         if not self.card_notebook:
@@ -1415,6 +1622,12 @@ class GremlinsAssistantApp:
             location_picker.bind(
                 "<<ComboboxSelected>>", lambda _: self._change_location_group()
             )
+        if scope == "all":
+            ttk.Button(
+                header,
+                text="管理重点卡牌",
+                command=self.open_important_cards_manager,
+            ).grid(row=0, column=1, sticky="e", padx=(8, 0))
         ttk.Button(
             header,
             text="回到顶部",
@@ -1438,6 +1651,7 @@ class GremlinsAssistantApp:
             "refresh_pending": False,
             "tile_widgets": {},
             "tile_counts": {},
+            "display_order": (),
         }
 
     def focus_card_panel(self) -> None:
@@ -1495,22 +1709,30 @@ class GremlinsAssistantApp:
         location_suffix = ""
         if scope == "normal" and self.location_group_var.get() != "全部":
             location_suffix = f" | {self.location_group_var.get()}"
+        important_count = sum(info.name in self.important_cards for info in cards)
         self.card_summary_vars[scope].set(
-            f"已使用 {used_card_count}/{len(cards)} 张，累计出现 {total_count} 次{location_suffix}"
+            f"重点 {important_count} 张 | 已使用 {used_card_count}/{len(cards)} 张，"
+            f"累计出现 {total_count} 次{location_suffix}"
         )
 
         width = max(panel["canvas"].winfo_width(), 416)
         columns = self._card_grid_column_count(width)
         card_names = {info.name for info in cards}
+        display_order = tuple(info.name for info in cards)
         tile_widgets: dict[str, dict[str, Any]] = panel["tile_widgets"]
         tile_counts: dict[str, int] = panel["tile_counts"]
-        needs_rebuild = columns != panel["columns"] or set(tile_widgets) != card_names
+        needs_rebuild = (
+            columns != panel["columns"]
+            or set(tile_widgets) != card_names
+            or panel["display_order"] != display_order
+        )
         canvas: tk.Canvas = panel["canvas"]
         if needs_rebuild:
             canvas.delete("all")
             tile_widgets.clear()
             tile_counts.clear()
             panel["columns"] = columns
+            panel["display_order"] = display_order
             grid_width = columns * (CARD_TILE_WIDTH + CARD_TILE_GUTTER)
             left_offset = max(0, (width - grid_width) // 2)
             for index, info in enumerate(cards):
@@ -1587,23 +1809,55 @@ class GremlinsAssistantApp:
             "photo": None,
         }
         self._apply_canvas_card_state(state, count)
+        for item_name in (
+            "tile",
+            "image_label",
+            "placeholder",
+            "name_label",
+            "count_label",
+        ):
+            canvas.tag_bind(
+                state[item_name],
+                "<Button-1>",
+                lambda _event, card_name=info.name: self._toggle_important_card(
+                    card_name
+                ),
+            )
         return state
+
+    def _toggle_important_card(self, card_name: str) -> None:
+        if card_name in self.important_cards:
+            self.important_cards.remove(card_name)
+        else:
+            self.important_cards.add(card_name)
+        self.config.important_cards = sorted(self.important_cards)
+        save_config(self.config)
+        self.refresh_card_panel()
 
     def _apply_canvas_card_state(self, state: dict[str, Any], count: int) -> None:
         info: CardInfo = state["info"]
         used = count > 0
-        background = "#3a2a1e" if used else "#454545"
-        border = "#c88a2c" if used else "#696969"
-        text_color = "#fff1c6" if used else "#d0d0d0"
+        important = info.name in self.important_cards
+        background = "#5a1b22" if important else "#3a2a1e" if used else "#454545"
+        border = "#ff4b43" if important else "#c88a2c" if used else "#696969"
+        text_color = "#fff4d6" if important or used else "#d0d0d0"
         canvas: tk.Canvas = state["canvas"]
-        canvas.itemconfigure(state["tile"], fill=background, outline=border)
-        canvas.itemconfigure(state["name_label"], text=info.name, fill=text_color)
+        canvas.itemconfigure(
+            state["tile"], fill=background, outline=border, width=4 if important else 1
+        )
+        canvas.itemconfigure(
+            state["name_label"],
+            text=f"重点\n{info.name}" if important else info.name,
+            fill=text_color,
+        )
         canvas.itemconfigure(
             state["count_label"],
             text=f"出现次数: {count}",
-            fill="#f1c66a" if used else "#b8b8b8",
+            fill="#ffd166" if important else "#f1c66a" if used else "#b8b8b8",
         )
-        photo = self._get_card_photo(info.name, info.image_path, used, state["image_size"])
+        photo = self._get_card_photo(
+            info.name, info.image_path, used or important, state["image_size"]
+        )
         state["photo"] = photo
         if photo:
             canvas.itemconfigure(state["image_label"], image=photo)
@@ -1615,18 +1869,47 @@ class GremlinsAssistantApp:
     def _catalog_cards(self, scope: str) -> list[CardInfo]:
         """Return each display card once; OCR aliases share its primary card entry."""
         cards_by_name: dict[str, CardInfo] = {}
-        catalog = self.card_catalog if scope == "normal" else self.misfortune_catalog
-        for info in catalog.values():
-            cards_by_name.setdefault(info.name, info)
+        catalogs = (
+            (self.card_catalog, self.misfortune_catalog)
+            if scope == "all"
+            else (self.card_catalog,) if scope == "normal" else (self.misfortune_catalog,)
+        )
+        for catalog in catalogs:
+            for info in catalog.values():
+                cards_by_name.setdefault(info.name, info)
         cards = list(cards_by_name.values())
         if scope == "normal" and self.location_group_var.get() != "全部":
             selected_group = self.location_group_var.get()
             cards = [
                 info for info in cards if selected_group in info.location_groups
             ]
-        return sorted(cards, key=lambda info: info.name)
+        counts = self._canonical_card_counts(scope)
+        return sorted(
+            cards,
+            key=lambda info: (
+                0
+                if info.name in self.important_cards
+                else 1
+                if info.name in self.latest_triggered_cards
+                else 2
+                if counts[info.name] > 0
+                else 3,
+                -counts[info.name],
+                info.name,
+            ),
+        )
+
+    def _canonical_display_name(self, matched_name: str) -> str:
+        info = self.card_catalog.get(matched_name) or self.misfortune_catalog.get(
+            matched_name
+        )
+        return info.name if info else matched_name
 
     def _canonical_card_counts(self, scope: str) -> Counter[str]:
+        if scope == "all":
+            return self._canonical_card_counts("normal") + self._canonical_card_counts(
+                "misfortune"
+            )
         counts: Counter[str] = Counter()
         catalog = self.card_catalog if scope == "normal" else self.misfortune_catalog
         source_counts = self.counter if scope == "normal" else self.misfortune_counter
@@ -1634,6 +1917,60 @@ class GremlinsAssistantApp:
             info = catalog.get(matched_name)
             counts[info.name if info else matched_name] += count
         return counts
+
+    def open_important_cards_manager(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("管理重点卡牌")
+        window.transient(self.root)
+        window.geometry("500x620")
+        window.minsize(380, 420)
+
+        outer = ttk.Frame(window, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+        ttk.Label(outer, text="重点卡牌").grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        choices = ttk.Frame(canvas)
+        choices.bind(
+            "<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        choices_window = canvas.create_window((0, 0), window=choices, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(choices_window, width=event.width),
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        scrollbar.grid(row=1, column=1, sticky="ns", padx=(8, 0))
+
+        card_names = sorted(info.name for info in self._catalog_cards("all"))
+        selected = {
+            name: tk.BooleanVar(value=name in self.important_cards) for name in card_names
+        }
+        for row, name in enumerate(card_names):
+            ttk.Checkbutton(choices, text=name, variable=selected[name]).grid(
+                row=row, column=0, sticky="w", padx=4, pady=2
+            )
+
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="取消", command=window.destroy).pack(side=tk.RIGHT)
+
+        def save_important_cards() -> None:
+            self.important_cards = {name for name, value in selected.items() if value.get()}
+            self.config.important_cards = sorted(self.important_cards)
+            save_config(self.config)
+            for panel in self.card_panels.values():
+                panel["display_order"] = ()
+            self.refresh_card_panel()
+            window.destroy()
+
+        ttk.Button(buttons, text="保存", command=save_important_cards).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
 
     def _add_card_status_tile(
         self,
@@ -1721,18 +2058,29 @@ class GremlinsAssistantApp:
     def _apply_card_tile_state(self, state: dict[str, Any], count: int) -> None:
         info: CardInfo = state["info"]
         used = count > 0
-        background = "#3a2a1e" if used else "#454545"
-        border = "#c88a2c" if used else "#696969"
-        text_color = "#fff1c6" if used else "#d0d0d0"
-        state["tile"].configure(bg=background, highlightbackground=border)
+        important = info.name in self.important_cards
+        background = "#5a1b22" if important else "#3a2a1e" if used else "#454545"
+        border = "#ff4b43" if important else "#c88a2c" if used else "#696969"
+        text_color = "#fff4d6" if important or used else "#d0d0d0"
+        state["tile"].configure(
+            bg=background,
+            highlightbackground=border,
+            highlightthickness=3 if important else 1,
+        )
         state["image_holder"].configure(bg=background)
-        state["name_label"].configure(bg=background, fg=text_color)
+        state["name_label"].configure(
+            text=f"重点\n{info.name}" if important else info.name,
+            bg=background,
+            fg=text_color,
+        )
         state["count_label"].configure(
             text=f"出现次数：{count}",
             bg=background,
-            fg="#f1c66a" if used else "#b8b8b8",
+            fg="#ffd166" if important else "#f1c66a" if used else "#b8b8b8",
         )
-        photo = self._get_card_photo(info.name, info.image_path, used, state["image_size"])
+        photo = self._get_card_photo(
+            info.name, info.image_path, used or important, state["image_size"]
+        )
         image_label: tk.Label = state["image_label"]
         if photo:
             image_label.configure(image=photo, text="", bg=background)
@@ -1776,10 +2124,12 @@ class GremlinsAssistantApp:
             frame = capture_window_client(self.config.selected_hwnd)
             active_roi = resolve_roi(self.config, frame)
             roi_frame, roi_bounds = clamp_roi(frame, active_roi)
-            text, _ = self.ocr_engine.read_text(prepare_ocr_image(roi_frame))
-            if self.config.roi_mode == ROI_MODE_BOTTOM_CARD:
-                text = clean_card_area_text(text)
-            matched_items = extract_card_name_items(text, self.card_names)
+            text, matched_items = read_card_text(
+                self.ocr_engine,
+                roi_frame,
+                self.card_names,
+                self.config.roi_mode == ROI_MODE_BOTTOM_CARD,
+            )
             matched_text = "\n".join(matched_items) or "未匹配到项目词表中的卡牌名称"
             self.text_output.delete("1.0", tk.END)
             self.text_output.insert(
@@ -1811,6 +2161,7 @@ class GremlinsAssistantApp:
             _, deck_counter_bounds = clamp_roi(
                 frame, resolve_deck_counter_roi(frame)
             )
+            _, game_state_bounds = clamp_roi(frame, resolve_game_state_roi(frame))
         except Exception as exc:
             messagebox.showerror("预览失败", str(exc))
             return
@@ -1836,6 +2187,7 @@ class GremlinsAssistantApp:
 
         draw_preview_box(roi_bounds, "CARD OCR", (255, 32, 32))
         draw_preview_box(deck_counter_bounds, "DECK COUNTS", (32, 220, 220))
+        draw_preview_box(game_state_bounds, "SCREEN GUARD", (80, 220, 100))
 
         max_width, max_height = 980, 680
         scale = min(max_width / preview.shape[1], max_height / preview.shape[0], 1.0)
@@ -1865,14 +2217,16 @@ class GremlinsAssistantApp:
         ttk.Label(
             window,
             text=(
-                f"红框：卡牌名称识别范围 | 青框：普通卡/厄运卡牌堆数量范围\n"
+                f"红框：卡牌名称识别范围 | 青框：普通卡/厄运卡牌堆数量范围 | "
+                f"绿框：菜单/遮挡画面检测范围\n"
                 f"模式: {mode_text} | 窗口: {frame.shape[1]}x{frame.shape[0]} | "
                 f"卡牌 ROI: {roi_bounds} | 比例: {ratio_text}"
             ),
             justify=tk.LEFT,
         ).pack(padx=10, pady=(0, 10))
         self.status_var.set(
-            f"已打开识别范围预览。卡牌 ROI={roi_bounds}，牌堆数量 ROI={deck_counter_bounds}"
+            f"已打开识别范围预览。卡牌 ROI={roi_bounds}，牌堆数量 ROI={deck_counter_bounds}，"
+            f"遮挡检测 ROI={game_state_bounds}"
         )
 
     def start_monitoring(self) -> None:
@@ -1914,10 +2268,6 @@ class GremlinsAssistantApp:
         self.stop_monitoring()
         if self.worker and self.worker.is_alive():
             self.worker.join(timeout=1.5)
-        if self.overlay_button and self.overlay_button.winfo_exists():
-            self.overlay_button.destroy()
-        if self.used_cards_window and self.used_cards_window.winfo_exists():
-            self.used_cards_window.destroy()
         save_config(self.config)
         self.root.destroy()
 
@@ -1957,6 +2307,7 @@ class GremlinsAssistantApp:
     def reset_counts(self) -> None:
         self.counter.clear()
         self.misfortune_counter.clear()
+        self.latest_triggered_cards = ()
         self.records.clear()
         self.last_text = ""
         self.summary_count_var.set("普通 0 次，厄运 0 次")
@@ -1968,7 +2319,7 @@ class GremlinsAssistantApp:
             self.worker.current_seen_signature = ""
             self.worker.previous_roi_signature = None
         self.text_output.delete("1.0", tk.END)
-        self.refresh_used_cards_window()
+        self.refresh_card_panel()
         self.status_var.set("统计结果已清空。")
 
     def _drain_events(self) -> None:
@@ -1999,6 +2350,14 @@ class GremlinsAssistantApp:
         if event["type"] == "error":
             self.status_var.set(f"监控出错: {event['message']}")
             return
+        if event["type"] == "game_state":
+            if event["blocked"]:
+                self.summary_monitor_var.set("暂停（遮挡画面）")
+                self.status_var.set("检测到菜单或遮挡画面，已暂停卡牌与牌堆统计。")
+            else:
+                self.summary_monitor_var.set("运行中")
+                self.status_var.set("已恢复正常对局画面，正在重新建立识别基准。")
+            return
         if event["type"] == "deck_update":
             self._set_separated_counters(event.get("counter", {}))
             if self.worker:
@@ -2021,7 +2380,6 @@ class GremlinsAssistantApp:
                     f"牌堆剩余数量已更新：普通 {normal}，厄运 {misfortune}。"
                 )
             self.refresh_card_panel()
-            self.refresh_used_cards_window()
             return
         if event["type"] == "capture_error":
             self._set_separated_counters(event.get("counter", {}))
@@ -2053,6 +2411,12 @@ class GremlinsAssistantApp:
         frame_shape = event["frame_shape"]
         duplicate = event["duplicate"]
         items_counted = event["items_counted"]
+        if items_counted:
+            self.latest_triggered_cards = tuple(
+                dict.fromkeys(
+                    self._canonical_display_name(name) for name in items_counted
+                )
+            )
         if text:
             self.last_text = text
         self.summary_monitor_var.set("运行中")
@@ -2075,8 +2439,8 @@ class GremlinsAssistantApp:
         if duplicate:
             status += "，这张卡牌画面仍在持续显示，已跳过重复累计。"
         self.status_var.set(status)
-        if items_counted or (self.used_cards_window and self.used_cards_window.winfo_exists()):
-            self.refresh_used_cards_window()
+        if items_counted:
+            self.refresh_card_panel()
 
 
 def truncate_text(value: str, limit: int = 28) -> str:
