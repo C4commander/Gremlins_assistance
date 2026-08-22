@@ -1,0 +1,2 @@
+dist/Gremlins_assistance.exe filter=lfs diff=lfs merge=lfs -text
+build/Gremlins_assistance/Gremlins_assistance.pkg filter=lfs diff=lfs merge=lfs -text

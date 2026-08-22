@@ -1,0 +1,23 @@
+{
+  "roi": {
+    "x": 316,
+    "y": 758,
+    "width": 657,
+    "height": 144
+  },
+  "roi_mode": "bottom_card",
+  "bottom_card_roi": {
+    "x": 0.25,
+    "y": 0.84,
+    "width": 0.52,
+    "height": 0.16
+  },
+  "interval_seconds": 0.01,
+  "count_repeated_frames": false,
+  "selected_hwnd": 330034,
+  "target_keyword": "Gremlins Inc|Gremlins, Inc|GremlinsInc",
+  "auto_detect_enabled": true,
+  "auto_lock_detected": true,
+  "auto_reset_on_deck_recycle": false,
+  "important_cards": []
+}
